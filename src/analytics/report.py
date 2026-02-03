@@ -53,6 +53,7 @@ class AnalyticsReport:
         drawdown_curve = self._generate_drawdown_curve(backtest_result)
         returns_series = self._generate_returns_series(backtest_result)
         monthly_returns = self._generate_monthly_returns(returns_series)
+        rolling_metrics = self._generate_rolling_metrics(returns_series)
 
         # Extract key information from backtest result
         report_data = {
@@ -64,6 +65,7 @@ class AnalyticsReport:
             'drawdown_curve': drawdown_curve,
             'returns_series': returns_series,
             'monthly_returns': monthly_returns,
+            'rolling_metrics': rolling_metrics,
         }
 
         return report_data
@@ -249,20 +251,81 @@ class AnalyticsReport:
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df['month'] = df['timestamp'].dt.to_period('M').astype(str)
         return df.groupby('month')['return'].sum().to_dict()
+
+    def _generate_rolling_metrics(self, returns_series: List[Dict[str, Any]], window: int = 30) -> List[Dict[str, Any]]:
+        if not returns_series:
+            return []
+        df = pd.DataFrame(returns_series)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['rolling_sharpe'] = df['return'].rolling(window).apply(
+            lambda x: calculate_sharpe_ratio(x, annualize=True), raw=False
+        )
+        df['rolling_volatility'] = df['return'].rolling(window).std() * np.sqrt(252)
+        df = df.dropna()
+        return [
+            {
+                'timestamp': row['timestamp'].isoformat(),
+                'rolling_sharpe': float(row['rolling_sharpe']),
+                'rolling_volatility': float(row['rolling_volatility']),
+            }
+            for _, row in df.iterrows()
+        ]
     
     def export_report(self, report_data: Dict[str, Any], filename: str = None) -> str:
         """
-        Export the report to various formats (JSON, CSV, HTML)
+        Export the report to JSON
         """
         if filename is None:
             filename = f"backtest_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        
-        # Export to JSON
+
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(report_data, f, indent=2, default=str)
-        
+
         print(f"Report exported to {filename}")
         return filename
+
+    def export_html_report(self, report_data: Dict[str, Any], output_dir: str, charts_dir: str = None) -> str:
+        """Export a simple HTML report"""
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        if charts_dir is None:
+            charts_dir = output_dir
+
+        summary = report_data['summary']
+        perf = report_data['performance_metrics']
+        risk = report_data['risk_metrics']
+
+        def _row(k, v):
+            return f"<tr><td>{k}</td><td>{v}</td></tr>"
+
+        summary_rows = "".join([_row(k, v) for k, v in summary.items()])
+        perf_rows = "".join([_row(k, getattr(perf, k) if hasattr(perf, k) else v) for k, v in perf.__dict__.items()])
+        risk_rows = "".join([_row(k, v) for k, v in risk.items()])
+
+        html = f"""
+        <html>
+        <head><title>Backtest Report</title></head>
+        <body>
+          <h1>Backtest Report</h1>
+          <h2>Summary</h2>
+          <table border='1'>{summary_rows}</table>
+          <h2>Performance Metrics</h2>
+          <table border='1'>{perf_rows}</table>
+          <h2>Risk Metrics</h2>
+          <table border='1'>{risk_rows}</table>
+          <h2>Charts</h2>
+          <img src='{os.path.join(charts_dir, 'equity_curve.png')}' width='900'/><br/>
+          <img src='{os.path.join(charts_dir, 'drawdown_curve.png')}' width='900'/><br/>
+          <img src='{os.path.join(charts_dir, 'returns_histogram.png')}' width='900'/><br/>
+          <img src='{os.path.join(charts_dir, 'monthly_returns.png')}' width='900'/><br/>
+          {"<img src='" + os.path.join(charts_dir, 'rolling_metrics.png') + "' width='900'/><br/>" if report_data.get('rolling_metrics') else ""}
+        </body>
+        </html>
+        """
+        out_path = os.path.join(output_dir, "report.html")
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write(html)
+        return out_path
     
     def generate_chart(self, chart_type: str, data: Any, title: str = "", save_path: str = None):
         """
@@ -304,6 +367,18 @@ class AnalyticsReport:
             plt.ylabel("Return")
             plt.xticks(rotation=45)
 
+        elif chart_type == "rolling_metrics":
+            timestamps = [point['timestamp'] for point in data]
+            sharpe = [point['rolling_sharpe'] for point in data]
+            vol = [point['rolling_volatility'] for point in data]
+            plt.plot(timestamps, sharpe, label='Rolling Sharpe')
+            plt.plot(timestamps, vol, label='Rolling Volatility')
+            plt.title(title or "Rolling Sharpe & Volatility")
+            plt.xlabel("Date")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.xticks(rotation=45)
+
         if save_path:
             plt.tight_layout()
             plt.savefig(save_path)
@@ -321,6 +396,8 @@ class AnalyticsReport:
         self.generate_chart("drawdown_curve", report_data['drawdown_curve'], save_path=f"{output_dir}/drawdown_curve.png")
         self.generate_chart("returns_histogram", report_data['returns_series'], save_path=f"{output_dir}/returns_histogram.png")
         self.generate_chart("monthly_returns", report_data['monthly_returns'], save_path=f"{output_dir}/monthly_returns.png")
+        if report_data.get('rolling_metrics'):
+            self.generate_chart("rolling_metrics", report_data['rolling_metrics'], save_path=f"{output_dir}/rolling_metrics.png")
 
 
 def print_report_summary(report_data: Dict[str, Any]):
