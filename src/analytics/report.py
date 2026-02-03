@@ -6,6 +6,7 @@ Generates reports and visualizations for trading strategy performance analysis.
 
 import json
 import pandas as pd
+import numpy as np
 from typing import Dict, List, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from io import StringIO
 import sys
+
+from .metrics import calculate_drawdown_series, calculate_sortino_ratio, calculate_sharpe_ratio
 
 
 @dataclass
@@ -45,16 +48,24 @@ class AnalyticsReport:
         Generate a comprehensive analytics report from backtest results
         """
         print("Generating analytics report...")
-        
+
+        equity_curve = self._generate_equity_curve(backtest_result)
+        drawdown_curve = self._generate_drawdown_curve(backtest_result)
+        returns_series = self._generate_returns_series(backtest_result)
+        monthly_returns = self._generate_monthly_returns(returns_series)
+
         # Extract key information from backtest result
         report_data = {
             'summary': self._generate_summary(backtest_result),
             'performance_metrics': self._calculate_performance_metrics(backtest_result),
             'trade_analysis': self._analyze_trades(backtest_result),
-            'risk_metrics': self._calculate_risk_metrics(backtest_result),
-            'equity_curve': self._generate_equity_curve(backtest_result)
+            'risk_metrics': self._calculate_risk_metrics(backtest_result, returns_series),
+            'equity_curve': equity_curve,
+            'drawdown_curve': drawdown_curve,
+            'returns_series': returns_series,
+            'monthly_returns': monthly_returns,
         }
-        
+
         return report_data
     
     def _generate_summary(self, backtest_result: Any) -> Dict[str, Any]:
@@ -165,40 +176,31 @@ class AnalyticsReport:
             'largest_loss': min(pnl_values) if pnl_values else 0
         }
     
-    def _calculate_risk_metrics(self, backtest_result: Any) -> Dict[str, Any]:
+    def _calculate_risk_metrics(self, backtest_result: Any, returns_series: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Calculate risk metrics"""
-        trades = backtest_result.trades
-        
-        if not trades:
+        if not returns_series:
             return {
                 'max_drawdown': backtest_result.max_drawdown,
                 'volatility': 0.0,
                 'var_95': 0.0,
-                'calmar_ratio': 0.0
+                'calmar_ratio': 0.0,
+                'sortino_ratio': 0.0
             }
-        
-        # Calculate volatility from portfolio history
-        portfolio_values = [state.total_value for state in backtest_result.portfolio_history]
-        returns = []
-        for i in range(1, len(portfolio_values)):
-            if portfolio_values[i-1] != 0:
-                returns.append((portfolio_values[i] - portfolio_values[i-1]) / portfolio_values[i-1])
-        
-        volatility = (sum([(r - sum(returns)/len(returns))**2 for r in returns]) / len(returns))**0.5 if returns else 0
-        
-        # VaR (Value at Risk) - 95th percentile of returns
+
+        returns = [r['return'] for r in returns_series]
+        volatility = np.std(returns) * 100
         sorted_returns = sorted(returns)
-        var_index = int(len(sorted_returns) * 0.05)  # 5th percentile
+        var_index = int(len(sorted_returns) * 0.05)
         var_95 = sorted_returns[var_index] if sorted_returns else 0
-        
-        # Calmar Ratio (return / max drawdown)
         calmar_ratio = (backtest_result.total_return / backtest_result.max_drawdown) if backtest_result.max_drawdown != 0 else 0
-        
+        sortino = calculate_sortino_ratio(returns)
+
         return {
             'max_drawdown': round(backtest_result.max_drawdown, 2),
-            'volatility': round(volatility * 100, 2),  # percentage
-            'var_95': round(var_95 * 100, 2),  # percentage
-            'calmar_ratio': round(calmar_ratio, 2)
+            'volatility': round(volatility, 2),
+            'var_95': round(var_95 * 100, 2),
+            'calmar_ratio': round(calmar_ratio, 2),
+            'sortino_ratio': round(sortino, 2)
         }
     
     def _generate_equity_curve(self, backtest_result: Any) -> List[Dict[str, Any]]:
@@ -211,6 +213,42 @@ class AnalyticsReport:
                 'cash': state.cash
             })
         return equity_points
+
+    def _generate_returns_series(self, backtest_result: Any) -> List[Dict[str, Any]]:
+        """Generate per-period returns from portfolio history"""
+        series = []
+        history = backtest_result.portfolio_history
+        for i in range(1, len(history)):
+            prev = history[i-1].total_value
+            cur = history[i].total_value
+            if prev == 0:
+                continue
+            r = (cur - prev) / prev
+            series.append({
+                'timestamp': history[i].timestamp.isoformat(),
+                'return': r
+            })
+        return series
+
+    def _generate_drawdown_curve(self, backtest_result: Any) -> List[Dict[str, Any]]:
+        """Generate drawdown series"""
+        equity = [s.total_value for s in backtest_result.portfolio_history]
+        dd = calculate_drawdown_series(equity)
+        curve = []
+        for idx, state in enumerate(backtest_result.portfolio_history):
+            curve.append({
+                'timestamp': state.timestamp.isoformat(),
+                'drawdown': float(dd.iloc[idx]) if len(dd) > idx else 0.0
+            })
+        return curve
+
+    def _generate_monthly_returns(self, returns_series: List[Dict[str, Any]]) -> Dict[str, float]:
+        if not returns_series:
+            return {}
+        df = pd.DataFrame(returns_series)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['month'] = df['timestamp'].dt.to_period('M').astype(str)
+        return df.groupby('month')['return'].sum().to_dict()
     
     def export_report(self, report_data: Dict[str, Any], filename: str = None) -> str:
         """
@@ -231,7 +269,7 @@ class AnalyticsReport:
         Generate a chart based on the specified type
         """
         plt.figure(figsize=(12, 6))
-        
+
         if chart_type == "equity_curve":
             timestamps = [point['timestamp'] for point in data]
             values = [point['value'] for point in data]
@@ -240,28 +278,49 @@ class AnalyticsReport:
             plt.xlabel("Date")
             plt.ylabel("Portfolio Value ($)")
             plt.xticks(rotation=45)
-        
-        elif chart_type == "pnl_distribution":
-            plt.hist(data, bins=30, edgecolor='black')
-            plt.title(title or "P&L Distribution")
-            plt.xlabel("Profit/Loss ($)")
+
+        elif chart_type == "drawdown_curve":
+            timestamps = [point['timestamp'] for point in data]
+            values = [point['drawdown'] * 100 for point in data]
+            plt.fill_between(timestamps, values, 0, alpha=0.4)
+            plt.title(title or "Drawdown (%)")
+            plt.xlabel("Date")
+            plt.ylabel("Drawdown (%)")
+            plt.xticks(rotation=45)
+
+        elif chart_type == "returns_histogram":
+            returns = [r['return'] for r in data]
+            plt.hist(returns, bins=30, edgecolor='black')
+            plt.title(title or "Returns Distribution")
+            plt.xlabel("Return")
             plt.ylabel("Frequency")
-        
+
         elif chart_type == "monthly_returns":
             months = list(data.keys())
             returns = list(data.values())
             plt.bar(months, returns)
             plt.title(title or "Monthly Returns")
             plt.xlabel("Month")
-            plt.ylabel("Return ($)")
+            plt.ylabel("Return")
             plt.xticks(rotation=45)
-        
+
         if save_path:
+            plt.tight_layout()
             plt.savefig(save_path)
             plt.close()
             print(f"Chart saved to {save_path}")
         else:
             plt.show()
+
+    def generate_default_charts(self, report_data: Dict[str, Any], output_dir: str):
+        """Generate default chart pack to output_dir"""
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+
+        self.generate_chart("equity_curve", report_data['equity_curve'], save_path=f"{output_dir}/equity_curve.png")
+        self.generate_chart("drawdown_curve", report_data['drawdown_curve'], save_path=f"{output_dir}/drawdown_curve.png")
+        self.generate_chart("returns_histogram", report_data['returns_series'], save_path=f"{output_dir}/returns_histogram.png")
+        self.generate_chart("monthly_returns", report_data['monthly_returns'], save_path=f"{output_dir}/monthly_returns.png")
 
 
 def print_report_summary(report_data: Dict[str, Any]):

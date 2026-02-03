@@ -2,8 +2,10 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Union, Optional
 
+TRADING_DAYS = 252
 
-def calculate_sharpe_ratio(returns: Union[pd.Series, List[float]], risk_free_rate: float = 0.0) -> float:
+
+def calculate_sharpe_ratio(returns: Union[pd.Series, List[float]], risk_free_rate: float = 0.0, annualize: bool = True) -> float:
     """
     Calculate the Sharpe ratio of a strategy's returns.
     
@@ -20,23 +22,18 @@ def calculate_sharpe_ratio(returns: Union[pd.Series, List[float]], risk_free_rat
     if len(returns) == 0:
         return 0.0
     
-    # Convert annualized risk_free_rate to the same frequency as returns
-    # For daily returns, we typically assume 252 trading days per year
     if len(returns) > 0:
         period_returns = returns
         excess_returns = period_returns - risk_free_rate
-        
+
         if excess_returns.std() == 0:
             return 0.0
-        
+
         sharpe_ratio = excess_returns.mean() / excess_returns.std()
-        
-        # Annualize if we have daily returns
-        # Assuming daily returns, multiply by sqrt(252)
-        if len(returns) > 1:
-            # Only annualize if we have reasonable amount of data
-            sharpe_ratio = sharpe_ratio * np.sqrt(len(returns)) if len(returns) > 1 else sharpe_ratio
-            
+
+        if annualize and len(returns) > 1:
+            sharpe_ratio = sharpe_ratio * np.sqrt(TRADING_DAYS)
+
         return sharpe_ratio
     else:
         return 0.0
@@ -87,7 +84,7 @@ def calculate_total_return(initial_capital: float, final_capital: float) -> floa
     return (final_capital - initial_capital) / initial_capital
 
 
-def calculate_volatility(returns: Union[pd.Series, List[float]]) -> float:
+def calculate_volatility(returns: Union[pd.Series, List[float]], annualize: bool = True) -> float:
     """
     Calculate the volatility of returns (standard deviation).
     
@@ -104,12 +101,10 @@ def calculate_volatility(returns: Union[pd.Series, List[float]]) -> float:
         return 0.0
     
     volatility = returns.std()
-    
-    # Annualize if we have daily returns (multiply by sqrt(252))
-    # We'll assume daily returns if we have many data points
-    if len(returns) > 10:
-        volatility = volatility * np.sqrt(len(returns))
-    
+
+    if annualize:
+        volatility = volatility * np.sqrt(TRADING_DAYS)
+
     return volatility
 
 
@@ -154,6 +149,38 @@ def calculate_profit_factor(trades: List[Dict]) -> float:
     return gains / losses
 
 
+def calculate_sortino_ratio(returns: Union[pd.Series, List[float]], risk_free_rate: float = 0.0, annualize: bool = True) -> float:
+    if isinstance(returns, list):
+        returns = pd.Series(returns)
+    if len(returns) == 0:
+        return 0.0
+    downside = returns[returns < 0]
+    if len(downside) == 0:
+        return float('inf')
+    downside_std = downside.std()
+    if downside_std == 0:
+        return 0.0
+    sortino = (returns.mean() - risk_free_rate) / downside_std
+    if annualize:
+        sortino = sortino * np.sqrt(TRADING_DAYS)
+    return sortino
+
+
+def calculate_cagr(initial_capital: float, final_capital: float, periods: int) -> float:
+    if initial_capital <= 0 or periods <= 0:
+        return 0.0
+    return (final_capital / initial_capital) ** (TRADING_DAYS / periods) - 1
+
+
+def calculate_drawdown_series(equity_curve: Union[pd.Series, List[float]]) -> pd.Series:
+    if isinstance(equity_curve, list):
+        equity_curve = pd.Series(equity_curve)
+    if len(equity_curve) == 0:
+        return pd.Series(dtype=float)
+    running_max = equity_curve.expanding().max()
+    return (equity_curve - running_max) / running_max
+
+
 def calculate_metrics(
     returns: Union[pd.Series, List[float]],
     equity_curve: Optional[Union[pd.Series, List[float]]] = None,
@@ -176,6 +203,7 @@ def calculate_metrics(
     
     # Basic metrics
     metrics['sharpe_ratio'] = calculate_sharpe_ratio(returns, risk_free_rate)
+    metrics['sortino_ratio'] = calculate_sortino_ratio(returns, risk_free_rate)
     metrics['volatility'] = calculate_volatility(returns)
     
     # Drawdown metrics
@@ -198,7 +226,11 @@ def calculate_metrics(
         metrics['average_return'] = returns_series.mean()
         metrics['best_return'] = returns_series.max()
         metrics['worst_return'] = returns_series.min()
-    
+
+    if equity_curve is not None and 'max_drawdown' in metrics:
+        md = metrics['max_drawdown']
+        metrics['calmar_ratio'] = (metrics.get('total_return', 0.0) / abs(md)) if md != 0 else 0.0
+
     return metrics
 
 
